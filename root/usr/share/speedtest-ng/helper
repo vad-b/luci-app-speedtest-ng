@@ -1,0 +1,230 @@
+#!/bin/sh
+#
+# This is free software, licensed under the GNU General Public License, version 3.
+#
+# Copyright (C) 2026 vad-b
+
+RESULT_JSON="/etc/speedtest-ng_results.json"
+LEGACY_RESULT="/etc/speedtest_result"
+MIGRATED_MARK="/etc/speedtest-ng_migrated"
+LEGACY_MIGRATOR="/usr/share/speedtest-ng/migrate-legacy"
+LOCK_FILE="/tmp/luci-app-speedtest-ng-results.lock"
+
+uuid() {
+	if [ -r /proc/sys/kernel/random/uuid ]; then
+		cat /proc/sys/kernel/random/uuid
+	else
+		printf '%s-%s' "$(date +%s)" "$$"
+	fi
+}
+
+timestamp() {
+	local base offset
+	base="$(date '+%Y-%m-%dT%H:%M:%S')"
+	offset="$(date '+%z')"
+	printf '%s%s:%s' "$base" "${offset%??}" "${offset#???}"
+}
+
+ensure_json_file() {
+	[ -s "$RESULT_JSON" ] || printf '[]\n' > "$RESULT_JSON"
+}
+
+# Run "$@" while holding an exclusive lock on the results file. The lock is
+# scoped strictly to the file read-modify-write, never around the speed test
+# itself, so concurrent UI actions (delete/note) and a running test do not
+# clobber each other.
+with_lock() {
+	(
+		flock -x 9 || { echo "Failed to acquire results lock" >&2; exit 1; }
+		"$@"
+	) 9>"$LOCK_FILE"
+}
+
+# Write JSON content to the results file atomically (temp + rename). Fails on
+# empty content so a failed transform never truncates the file.
+write_atomic() {
+	local content="$1"
+	local tmp="${RESULT_JSON}.tmp.$$"
+
+	[ -n "$content" ] || return 1
+	printf '%s\n' "$content" > "$tmp" && mv "$tmp" "$RESULT_JSON"
+}
+
+# Append a record object (JSON string) to the results array using ucode, which
+# preserves null/number/unicode/escaping faithfully. Assigns a monotonic seq
+# (max existing + 1), writes the file atomically, and prints the stored record
+# (with seq) on stdout. Must run under with_lock.
+append_record() {
+	local tmp="${RESULT_JSON}.tmp.$$"
+
+	ensure_json_file
+	SPD_FILE="$RESULT_JSON" SPD_TMP="$tmp" SPD_RECORD="$1" ucode -e '
+		let fs = require("fs");
+		let arr = json(fs.readfile(getenv("SPD_FILE")));
+		if (type(arr) != "array") arr = [];
+		let rec = json(getenv("SPD_RECORD"));
+		if (type(rec) != "object") { warn("invalid record\n"); exit(1); }
+		let maxseq = 0;
+		for (let i = 0; i < length(arr); i++)
+			if (type(arr[i].seq) == "int" && arr[i].seq > maxseq)
+				maxseq = arr[i].seq;
+		rec.seq = maxseq + 1;
+		push(arr, rec);
+		fs.writefile(getenv("SPD_TMP"), sprintf("%.2J\n", arr));
+		print(sprintf("%J", rec));
+	' || { rm -f "$tmp"; return 1; }
+	[ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
+	mv "$tmp" "$RESULT_JSON"
+}
+
+# Remove the record with the given id. Must run under with_lock.
+delete_record() {
+	local out
+
+	ensure_json_file
+	out="$(SPD_FILE="$RESULT_JSON" SPD_ID="$1" ucode -e '
+		let fs = require("fs");
+		let arr = json(fs.readfile(getenv("SPD_FILE")));
+		if (type(arr) != "array") arr = [];
+		let id = getenv("SPD_ID");
+		print(sprintf("%.2J", filter(arr, function(r) { return r.id != id; })));
+	')" || return 1
+	write_atomic "$out"
+}
+
+# Set the note field of the record with the given id. Must run under with_lock.
+note_record() {
+	local out
+
+	ensure_json_file
+	out="$(SPD_FILE="$RESULT_JSON" SPD_ID="$1" SPD_NOTE="$2" ucode -e '
+		let fs = require("fs");
+		let arr = json(fs.readfile(getenv("SPD_FILE")));
+		if (type(arr) != "array") arr = [];
+		let id = getenv("SPD_ID");
+		let note = getenv("SPD_NOTE");
+		for (let i = 0; i < length(arr); i++)
+			if (arr[i].id == id) arr[i].note = note;
+		print(sprintf("%.2J", arr));
+	')" || return 1
+	write_atomic "$out"
+}
+
+# Replace all results with an empty array. Must run under with_lock.
+clear_records() {
+	write_atomic '[]'
+}
+
+migrate_legacy() {
+	[ -f "$LEGACY_RESULT" ] || return 0
+	[ -f "$MIGRATED_MARK" ] && return 0
+
+	if [ ! -x "$LEGACY_MIGRATOR" ]; then
+		echo "Legacy migrator is not executable: $LEGACY_MIGRATOR" >&2
+		return 1
+	fi
+
+	"$LEGACY_MIGRATOR"
+}
+
+# Build a result record object from the speed test JSON output. Pure transform
+# (no file access, no lock): parses the response once with ucode and maps it to
+# the stored schema, preserving null/number types natively. The seq field is
+# assigned later by append_record under the lock.
+build_record() {
+	SPD_RESPONSE="$1" SPD_ID="$2" SPD_TS="$3" SPD_TRIGGER="$4" SPD_TEST="$5" SPD_NOTE="$6" ucode -e '
+		let resp = json(getenv("SPD_RESPONSE")) || {};
+		let s = resp.server || {};
+		let c = resp.client || {};
+		printf("%J", {
+			id: getenv("SPD_ID"),
+			timestamp: getenv("SPD_TS"),
+			trigger: getenv("SPD_TRIGGER"),
+			test: getenv("SPD_TEST"),
+			server: {
+				id: s.id,
+				host: s.host,
+				name: s.name,
+				sponsor: s.sponsor,
+				distance_km: s.distance
+			},
+			client: {
+				ip: c.ip,
+				isp: c.isp,
+				lat: c.lat,
+				lon: c.lon
+			},
+			ping_ms: resp.ping,
+			jitter_ms: resp.jitter,
+			latency_ms: s.latency,
+			download_mbit: resp.download_mbit,
+			upload_mbit: resp.upload_mbit,
+			note: getenv("SPD_NOTE")
+		});
+	'
+}
+
+run_test() {
+	local trigger="$1"
+	local test="$2"
+	local note="${3:-}"
+	local response record stored id ts
+
+	set -- speedtest --output json
+	[ "$test" != "all" ] && set -- "$@" "--$test"
+
+	response="$("$@")" || {
+		printf '{"error":"speedtest failed"}\n'
+		return 1
+	}
+
+	migrate_legacy
+
+	id="$(uuid)"
+	ts="$(timestamp)"
+
+	record="$(build_record "$response" "$id" "$ts" "$trigger" "$test" "$note")" || {
+		printf '{"error":"failed to build result"}\n'
+		return 1
+	}
+
+	stored="$(with_lock append_record "$record")" || {
+		printf '{"error":"failed to store result"}\n'
+		return 1
+	}
+
+	printf '{"record":%s}\n' "$stored"
+}
+
+case "$1" in
+	migrate)
+		migrate_legacy
+		;;
+	list)
+		migrate_legacy
+		ensure_json_file
+		cat "$RESULT_JSON"
+		;;
+	run)
+		shift
+		[ $# -ge 2 ] || { echo "Syntax: $0 run <manual|scheduled> <all|latency|download|upload> [note]" >&2; exit 1; }
+		run_test "$1" "$2" "${3:-}"
+		;;
+	delete)
+		shift
+		[ $# -ge 1 ] || { echo "Syntax: $0 delete <id>" >&2; exit 1; }
+		with_lock delete_record "$1"
+		;;
+	note)
+		shift
+		[ $# -ge 1 ] || { echo "Syntax: $0 note <id> [text]" >&2; exit 1; }
+		with_lock note_record "$1" "${2:-}"
+		;;
+	clear)
+		with_lock clear_records
+		;;
+	*)
+		echo "Syntax: $0 <migrate|list|run|delete|note|clear>" >&2
+		exit 1
+		;;
+esac

@@ -1,0 +1,91 @@
+#!/bin/sh
+#
+# This is free software, licensed under the GNU General Public License, version 3.
+#
+# Copyright (C) 2026 vad-b
+#
+# Translates the UCI schedule section into a single crontab entry that fires the
+# speed test helper, and runs scheduled tests when that entry triggers.
+
+CONFIG="speedtest-ng"
+HELPER="/usr/share/speedtest-ng/helper"
+CRONTAB="/etc/crontabs/root"
+CRON_MARK="/usr/share/speedtest-ng/schedule"
+
+kmsg() {
+	echo "<6>Speedtest: $1" > /dev/kmsg
+}
+
+cfg() {
+	uci -q get "${CONFIG}.schedule.$1"
+}
+
+# Drop only the crontab lines that belong to this app, leaving other jobs alone.
+drop_own_cron() {
+	[ -f "$CRONTAB" ] && sed -i "\\#${CRON_MARK}#d" "$CRONTAB"
+}
+
+# frequency (minutes, 1..60) -> cron minute field
+minute_field() {
+	if [ "$1" -ge 60 ] 2>/dev/null; then
+		echo "0"
+	else
+		echo "*/$1"
+	fi
+}
+
+# start/stop hour -> cron hour field (equal hours span the whole day)
+hour_field() {
+	[ "$1" = "$2" ] && echo "*" || echo "$1-$2"
+}
+
+# space-separated UCI day list -> cron day-of-week field
+dow_field() {
+	case "$1" in
+		"1 2 3 4 5 6 7" | "" | "*") echo "*" ;;
+		*) echo "$1" | tr ' ' ',' ;;
+	esac
+}
+
+run_scheduled() {
+	"$HELPER" run scheduled "$1" >/dev/null || \
+		kmsg "scheduled test failed; check the internet connection."
+}
+
+apply_schedule() {
+	drop_own_cron
+
+	if [ "$(cfg enable)" != "1" ]; then
+		kmsg "schedule disabled."
+		return
+	fi
+
+	local freq start stop days test
+	freq="$(cfg frequency)"
+	start="$(cfg start)"
+	stop="$(cfg stop)"
+	days="$(cfg days)"
+	test="$(cfg test)"
+
+	printf '%s %s * * %s %s start %s\n' \
+		"$(minute_field "$freq")" \
+		"$(hour_field "$start" "$stop")" \
+		"$(dow_field "$days")" \
+		"$CRON_MARK" "$test" >> "$CRONTAB"
+
+	kmsg "schedule enabled: test=${test}, every ${freq} min, hours ${start}-${stop}."
+}
+
+case "$1" in
+	start)
+		[ -n "$2" ] || { echo "Usage: $0 start <all|latency|download|upload>" >&2; exit 1; }
+		run_scheduled "$2"
+		;;
+	update)
+		apply_schedule
+		;;
+	*)
+		echo "Usage: $0 {start <type>|update}" >&2
+		exit 1
+		;;
+esac

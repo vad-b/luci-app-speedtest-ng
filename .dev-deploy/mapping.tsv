@@ -1,0 +1,12 @@
+# local_path_from_deploy_dir<TAB+>remote_absolute_path<TAB+>mode<TAB+>policy
+# Policies:
+# - overwrite: always copy local file over remote file
+# - keep-if-exists: copy only when remote file does not exist
+
+../htdocs/luci-static/resources/view/speedtest-ng/speedtest.js	/www/luci-static/resources/view/speedtest-ng/speedtest.js	644	overwrite
+../root/usr/share/luci/menu.d/luci-app-speedtest-ng.json	/usr/share/luci/menu.d/luci-app-speedtest-ng.json	644	overwrite
+../root/usr/share/rpcd/acl.d/luci-app-speedtest-ng.json	/usr/share/rpcd/acl.d/luci-app-speedtest-ng.json	644	overwrite
+../root/usr/share/speedtest-ng/helper	/usr/share/speedtest-ng/helper	755	overwrite
+../root/usr/share/speedtest-ng/migrate-legacy	/usr/share/speedtest-ng/migrate-legacy	755	overwrite
+../root/usr/share/speedtest-ng/schedule	/usr/share/speedtest-ng/schedule	755	overwrite
+../root/etc/config/speedtest-ng	/etc/config/speedtest-ng	644	keep-if-exists

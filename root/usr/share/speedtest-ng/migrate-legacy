@@ -1,0 +1,246 @@
+#!/bin/sh
+#
+# This is free software, licensed under the GNU General Public License, version 3.
+#
+# Copyright (C) 2026 vad-b
+
+RESULT_JSON="/etc/speedtest-ng_results.json"
+LEGACY_RESULT="/etc/speedtest_result"
+MIGRATED_MARK="/etc/speedtest-ng_migrated"
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s/\r//g; s/$/\\n/' | tr -d '\n' | sed 's/\\n$//'
+}
+
+trim() {
+	local value="$1"
+	value="${value#"${value%%[![:space:]]*}"}"
+	value="${value%"${value##*[![:space:]]}"}"
+	printf '%s' "$value"
+}
+
+lower() {
+	printf '%s' "$1" | tr 'A-Z' 'a-z'
+}
+
+number_or_null() {
+	local value
+	value="$(printf '%s' "$1" | grep -oE '[-]?[0-9]+([.][0-9]+)?' | head -n 1)"
+	[ -n "$value" ] && printf '%s' "$value" || printf 'null'
+}
+
+json_string_or_null() {
+	[ -n "$1" ] && printf '"%s"' "$(json_escape "$1")" || printf 'null'
+}
+
+uuid() {
+	if [ -r /proc/sys/kernel/random/uuid ]; then
+		cat /proc/sys/kernel/random/uuid
+	else
+		printf '%s-%s' "$(date +%s)" "$$"
+	fi
+}
+
+timezone_offset() {
+	local offset
+	offset="$(date '+%z')"
+	if [ -n "$offset" ]; then
+		printf '%s:%s' "${offset%??}" "${offset#???}"
+	else
+		printf '+00:00'
+	fi
+}
+
+month_number() {
+	case "$(lower "$1")" in
+		jan|january) printf '01' ;;
+		feb|february) printf '02' ;;
+		mar|march) printf '03' ;;
+		apr|april) printf '04' ;;
+		may) printf '05' ;;
+		jun|june) printf '06' ;;
+		jul|july) printf '07' ;;
+		aug|august) printf '08' ;;
+		sep|sept|september) printf '09' ;;
+		oct|october) printf '10' ;;
+		nov|november) printf '11' ;;
+		dec|december) printf '12' ;;
+		*) printf '' ;;
+	esac
+}
+
+int_value() {
+	local value
+	value="$(printf '%s' "$1" | sed 's/^0*//')"
+	[ -n "$value" ] && printf '%s' "$value" || printf '0'
+}
+
+legacy_timestamp() {
+	local date_text="$1"
+	local time_text="$2"
+	local date_part month day month_num day_num clock period hour minute hour_num minute_num year offset
+
+	date_part="$(printf '%s' "$date_text" | sed 's/^[^,]*,[[:space:]]*//')"
+	set -- $date_part
+	month="$1"
+	day="$2"
+	day="${day%,}"
+
+	month_num="$(month_number "$month")"
+	day_num="$(int_value "$day")"
+
+	set -- $time_text
+	clock="$1"
+	period="$(lower "$2")"
+	hour="${clock%:*}"
+	minute="${clock#*:}"
+	hour_num="$(int_value "$hour")"
+	minute_num="$(int_value "$minute")"
+
+	[ -n "$month_num" ] || return 1
+	[ "$day_num" -ge 1 ] 2>/dev/null && [ "$day_num" -le 31 ] 2>/dev/null || return 1
+	[ "$hour_num" -ge 1 ] 2>/dev/null && [ "$hour_num" -le 12 ] 2>/dev/null || return 1
+	[ "$minute_num" -ge 0 ] 2>/dev/null && [ "$minute_num" -le 59 ] 2>/dev/null || return 1
+
+	case "$period" in
+		pm) [ "$hour_num" -lt 12 ] && hour_num=$((hour_num + 12)) ;;
+		am) [ "$hour_num" -eq 12 ] && hour_num=0 ;;
+		*) return 1 ;;
+	esac
+
+	year="$(date '+%Y')"
+	offset="$(timezone_offset)"
+	printf '%04d-%s-%02dT%02d:%02d:00%s' "$year" "$month_num" "$day_num" "$hour_num" "$minute_num" "$offset"
+}
+
+ensure_json_file() {
+	[ -s "$RESULT_JSON" ] || printf '[]\n' > "$RESULT_JSON"
+}
+
+append_record() {
+	local record="$1"
+	local tmp="${RESULT_JSON}.tmp.$$"
+
+	ensure_json_file
+	if ! grep -q '^[[:space:]]*\[' "$RESULT_JSON"; then
+		printf '[]\n' > "$RESULT_JSON"
+	fi
+
+	if grep -q '"id"' "$RESULT_JSON"; then
+		sed '$d' "$RESULT_JSON" > "$tmp"
+		printf ',\n%s\n]\n' "$record" >> "$tmp"
+	else
+		printf '[\n%s\n]\n' "$record" > "$tmp"
+	fi
+	mv "$tmp" "$RESULT_JSON"
+}
+
+trigger_from_method() {
+	case "$(lower "$1")" in
+		luci) printf 'manual' ;;
+		schedule) printf 'scheduled' ;;
+		*) printf '' ;;
+	esac
+}
+
+test_from_legacy() {
+	local value
+	value="$(trim "$(lower "$1")")"
+
+	case "$value" in
+		all) printf 'all' ;;
+		latency) printf 'latency' ;;
+		download|download\ speed) printf 'download' ;;
+		upload|upload\ speed) printf 'upload' ;;
+		*) printf 'all' ;;
+	esac
+}
+
+legacy_record() {
+	local date_text="$1"
+	local time_text="$2"
+	local method="$3"
+	local test="$4"
+	local ping="$5"
+	local jitter="$6"
+	local latency="$7"
+	local download="$8"
+	local upload="$9"
+	local seq="${10}"
+	local trigger test_name timestamp_value
+
+	trigger="$(trigger_from_method "$method")"
+	test_name="$(test_from_legacy "$test")"
+	timestamp_value="$(legacy_timestamp "$date_text" "$time_text" 2>/dev/null || true)"
+
+	if [ -n "$timestamp_value" ]; then
+		cat <<EOF
+{
+  "seq":$seq,
+  "id":"$(json_escape "$(uuid)")",
+  "timestamp":"$(json_escape "$timestamp_value")",
+  "trigger":$(json_string_or_null "$trigger"),
+  "test":$(json_string_or_null "$test_name"),
+  "server":null,
+  "client":null,
+  "ping_ms":$(number_or_null "$ping"),
+  "jitter_ms":$(number_or_null "$jitter"),
+  "latency_ms":$(number_or_null "$latency"),
+  "download_mbit":$(number_or_null "$download"),
+  "upload_mbit":$(number_or_null "$upload"),
+  "note":""
+}
+EOF
+	else
+		cat <<EOF
+{
+  "seq":$seq,
+  "id":"$(json_escape "$(uuid)")",
+  "timestamp":null,
+  "legacy_date":$(json_string_or_null "$date_text"),
+  "legacy_time":$(json_string_or_null "$time_text"),
+  "trigger":$(json_string_or_null "$trigger"),
+  "test":$(json_string_or_null "$test_name"),
+  "server":null,
+  "client":null,
+  "ping_ms":$(number_or_null "$ping"),
+  "jitter_ms":$(number_or_null "$jitter"),
+  "latency_ms":$(number_or_null "$latency"),
+  "download_mbit":$(number_or_null "$download"),
+  "upload_mbit":$(number_or_null "$upload"),
+  "note":""
+}
+EOF
+	fi
+}
+
+migrate() {
+	local line date_text time_text method test ping jitter latency download upload record
+
+	[ -f "$LEGACY_RESULT" ] || return 0
+	[ -f "$MIGRATED_MARK" ] && return 0
+
+	ensure_json_file
+	tail -n +2 "$LEGACY_RESULT" | while IFS= read -r line; do
+		[ -n "$(printf '%s' "$line" | tr -d '[:space:]|')" ] || continue
+		IFS='|' read -r _ date_text time_text method test ping jitter latency download upload _ <<EOF
+$line
+EOF
+		seq=$(( ${seq:-0} + 1 ))
+		record="$(legacy_record \
+			"$(trim "$date_text")" \
+			"$(trim "$time_text")" \
+			"$(trim "$method")" \
+			"$(trim "$test")" \
+			"$(trim "$ping")" \
+			"$(trim "$jitter")" \
+			"$(trim "$latency")" \
+			"$(trim "$download")" \
+			"$(trim "$upload")" \
+			"$seq")"
+		append_record "$record"
+	done
+	: > "$MIGRATED_MARK"
+}
+
+migrate

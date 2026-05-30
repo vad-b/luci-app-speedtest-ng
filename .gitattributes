@@ -1,0 +1,7 @@
+* text=auto
+*.sh text eol=lf
+install text eol=lf
+Makefile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+root/usr/share/speedtest-ng/* text eol=lf

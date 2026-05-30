@@ -1,0 +1,5 @@
+
+config speedtest 'display'
+	option time_format '24h'
+
+config speedtest 'schedule'

@@ -1,0 +1,15 @@
+{
+	"luci-app-speedtest-ng": {
+		"description": "Grant access to Speedtest NG",
+		"read": {
+			"uci": [ "speedtest-ng" ],
+			"file": {
+				"/usr/share/speedtest-ng/helper": [ "exec" ],
+				"/usr/share/speedtest-ng/schedule": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "speedtest-ng" ]
+		}
+	}
+}
