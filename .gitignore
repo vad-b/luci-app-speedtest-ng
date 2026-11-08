@@ -1,10 +1,10 @@
-.dev-deploy/target.env
-.dev-deploy/.ssh/
-.temp/
-.claude/settings.local.json
+# Development tooling
+/.dev/build-packages/artifacts/
+/.dev/**/target.env
+/.dev/**/.ssh/
 
-# runtime data files (created on the router, never shipped)
-root/etc/speedtest_result
-root/etc/speedtest_result.legacy
-root/etc/speedtest-ng_results.json
-root/etc/speedtest-ng_migrated
+# Router runtime data
+/root/etc/speedtest_result
+/root/etc/speedtest_result.legacy
+/root/etc/speedtest-ng_results.json
+/root/etc/speedtest-ng_migrated

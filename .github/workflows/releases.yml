@@ -1,0 +1,98 @@
+name: Build Packages
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Makefile
+      - po/**
+      - htdocs/**
+      - root/**
+      - .dev/build-packages/**
+      - .github/workflows/releases.yml
+  pull_request:
+    paths:
+      - Makefile
+      - po/**
+      - htdocs/**
+      - root/**
+      - .dev/build-packages/**
+      - .github/workflows/releases.yml
+
+permissions:
+  contents: read
+
+env:
+  TZ: Europe/Madrid
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      has_update: ${{ steps.version.outputs.has_update }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check release version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(sed -n 's/^PKG_VERSION:=//p' Makefile)"
+          latest=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "has_update=$([ "$tag" != "$latest" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        format: [ipk, apk]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install SDK prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison gawk gcc-multilib g++-multilib gettext libncurses-dev libssl-dev python3-setuptools rsync unzip zlib1g-dev file wget curl zstd
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/luci-app-speedtest-ng
+          key: openwrt-sdk-${{ matrix.format }}-${{ hashFiles('.dev/build-packages/build-packages.sh') }}
+      - name: Build application
+        env:
+          JOBS: '2'
+        run: bash .dev/build-packages/build-packages.sh "${{ matrix.format }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ matrix.format }}
+          path: .dev/build-packages/artifacts/${{ matrix.format }}/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && needs.version.outputs.has_update == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: packages-*
+          path: .dev/build-packages/artifacts
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.version.outputs.tag }}
+          files: |
+            .dev/build-packages/artifacts/**/*.ipk
+            .dev/build-packages/artifacts/**/*.apk
+          fail_on_unmatched_files: true
