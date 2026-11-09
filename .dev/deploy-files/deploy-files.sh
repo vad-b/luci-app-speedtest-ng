@@ -15,8 +15,10 @@ MAP_DST=()
 MAP_MODE=()
 MAP_POLICY=()
 
+APP_VERSION="$(sed -n 's/^PKG_VERSION:=//p' "$APP_ROOT/Makefile" | tr -d '\r')"
 ROUTER_TOOLS=(uci ucode speedtest scp ls awk)
 POST_SYNC_COMMANDS=(
+  "sed -i 's/@APP_VERSION@/$APP_VERSION/g' /www/luci-static/resources/view/speedtest-ng/speedtest.js"
   "rm -f /tmp/luci-indexcache*"
   "/etc/init.d/rpcd restart"
   "/usr/share/speedtest-ng/schedule update"
