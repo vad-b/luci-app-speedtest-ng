@@ -9,6 +9,7 @@ set -eu
 PKG_NAME="luci-app-speedtest-ng"
 REPO="vad-b/luci-app-speedtest-ng"
 API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+DOWNLOAD_TIMEOUT=15
 
 log() {
 	echo "[install.sh] $*"
@@ -17,6 +18,27 @@ log() {
 fail() {
 	echo "[install.sh] ERROR: $*" >&2
 	exit 1
+}
+
+fetch_url() {
+	if wget -q -T "${DOWNLOAD_TIMEOUT}" -O "$2" "$1"; then
+		return 0
+	fi
+	rm -f "$2"
+	log "wget failed or timed out; trying curl"
+
+	if ! command -v curl >/dev/null 2>&1; then
+		log "Installing curl with ${PKG_MGR}"
+		if [ "${PKG_MGR}" = "apk" ]; then
+			apk update || fail "failed to update package indexes for curl"
+			apk add curl || fail "failed to install curl"
+		else
+			opkg update || fail "failed to update package indexes for curl"
+			opkg install curl || fail "failed to install curl"
+		fi
+	fi
+
+	curl -fLsS --max-time "${DOWNLOAD_TIMEOUT}" -o "$2" "$1"
 }
 
 command -v wget >/dev/null 2>&1 || fail "wget is required but not found"
@@ -32,16 +54,20 @@ else
 fi
 
 TMP_JSON="/tmp/${PKG_NAME}-latest.json"
+PKG_FILE=''
 
 cleanup() {
 	rm -f "${TMP_JSON}"
+	if [ -n "${PKG_FILE}" ]; then
+		rm -f "${PKG_FILE}"
+	fi
 }
 
 trap cleanup EXIT
 
 log "Detected package manager: ${PKG_MGR} (expecting .${PKG_EXT})"
 log "Fetching latest release metadata"
-wget -qO "${TMP_JSON}" "${API_URL}" || fail "failed to fetch release metadata"
+fetch_url "${API_URL}" "${TMP_JSON}" || fail "failed to fetch release metadata"
 
 DOWNLOAD_URL="$(tr ',' '\n' < "${TMP_JSON}" \
 	| sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\)".*/\1/p' \
@@ -53,7 +79,7 @@ DOWNLOAD_URL="$(tr ',' '\n' < "${TMP_JSON}" \
 PKG_FILE="/tmp/$(basename "${DOWNLOAD_URL}")"
 
 log "Downloading ${PKG_FILE}"
-wget -qO "${PKG_FILE}" "${DOWNLOAD_URL}" || fail "failed to download package"
+fetch_url "${DOWNLOAD_URL}" "${PKG_FILE}" || fail "failed to download package"
 
 log "Installing ${PKG_FILE}"
 if [ "${PKG_MGR}" = "apk" ]; then
