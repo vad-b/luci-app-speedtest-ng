@@ -22,15 +22,15 @@ Need manual package install options instead? See [Manual Installation](#manual-i
   <tr>
     <td align="center" valign="top" width="33.33%">
       <b>Runs</b><br/>
-      <img src="docs/images/runs.png" alt="Runs" width="100%"/>
+      <img src="docs/images/speedtest-ng-runs.png" alt="Runs" width="100%"/>
     </td>
     <td align="center" valign="top" width="33.33%">
       <b>Run Details</b><br/>
-      <img src="docs/images/run-details.png" alt="Run Details" width="100%"/>
+      <img src="docs/images/speedtest-ng-run-details.png" alt="Run Details" width="100%"/>
     </td>
     <td align="center" valign="top" width="33.33%">
       <b>Settings</b><br/>
-      <img src="docs/images/settings.png" alt="Settings" width="100%"/>
+      <img src="docs/images/speedtest-ng-settings.png" alt="Settings" width="100%"/>
     </td>
   </tr>
 </table>
@@ -78,6 +78,7 @@ apk add --allow-untrusted --upgrade /tmp/luci-app-speedtest-ng-*.apk
 - [Router SSH Tooling](.dev/router-ssh/README.md) — Configure router access, run commands, transfer files, and work in an open SSH session.
 - [Deploy Files](.dev/deploy-files/README.md) — Push working-tree files to the router for testing without building a package.
 - [Build Packages](.dev/build-packages/README.md) — Build `.apk` and `.ipk` packages locally using the same script as CI.
+- [Capture Screenshots](.dev/capture-screenshots/README.md) — Capture LuCI pages with a consistent width and synthetic data.
 
 ## License
 
