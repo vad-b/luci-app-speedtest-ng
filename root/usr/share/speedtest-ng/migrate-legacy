@@ -114,25 +114,7 @@ legacy_timestamp() {
 }
 
 ensure_json_file() {
-	[ -s "$RESULT_JSON" ] || printf '[]\n' > "$RESULT_JSON"
-}
-
-append_record() {
-	local record="$1"
-	local tmp="${RESULT_JSON}.tmp.$$"
-
-	ensure_json_file
-	if ! grep -q '^[[:space:]]*\[' "$RESULT_JSON"; then
-		printf '[]\n' > "$RESULT_JSON"
-	fi
-
-	if grep -q '"id"' "$RESULT_JSON"; then
-		sed '$d' "$RESULT_JSON" > "$tmp"
-		printf ',\n%s\n]\n' "$record" >> "$tmp"
-	else
-		printf '[\n%s\n]\n' "$record" > "$tmp"
-	fi
-	mv "$tmp" "$RESULT_JSON"
+	[ -e "$RESULT_JSON" ] || printf '[]\n' > "$RESULT_JSON"
 }
 
 trigger_from_method() {
@@ -166,7 +148,6 @@ legacy_record() {
 	local latency="$7"
 	local download="$8"
 	local upload="$9"
-	local seq="${10}"
 	local trigger test_name timestamp_value
 
 	trigger="$(trigger_from_method "$method")"
@@ -176,7 +157,6 @@ legacy_record() {
 	if [ -n "$timestamp_value" ]; then
 		cat <<EOF
 {
-  "seq":$seq,
   "id":"$(json_escape "$(uuid)")",
   "timestamp":"$(json_escape "$timestamp_value")",
   "trigger":$(json_string_or_null "$trigger"),
@@ -194,7 +174,6 @@ EOF
 	else
 		cat <<EOF
 {
-  "seq":$seq,
   "id":"$(json_escape "$(uuid)")",
   "timestamp":null,
   "legacy_date":$(json_string_or_null "$date_text"),
@@ -214,19 +193,15 @@ EOF
 	fi
 }
 
-migrate() {
-	local line date_text time_text method test ping jitter latency download upload record
-
-	[ -f "$LEGACY_RESULT" ] || return 0
-	[ -f "$MIGRATED_MARK" ] && return 0
-
-	ensure_json_file
-	tail -n +2 "$LEGACY_RESULT" | while IFS= read -r line; do
+# Prepare the entire legacy history before modifying the current results.
+prepare_legacy() {
+	local line date_text time_text method test ping jitter latency download upload record comma=''
+	printf '[\n'
+	tail -n +2 "$LEGACY_RESULT" | while IFS= read -r line || [ -n "$line" ]; do
 		[ -n "$(printf '%s' "$line" | tr -d '[:space:]|')" ] || continue
 		IFS='|' read -r _ date_text time_text method test ping jitter latency download upload _ <<EOF
 $line
 EOF
-		seq=$(( ${seq:-0} + 1 ))
 		record="$(legacy_record \
 			"$(trim "$date_text")" \
 			"$(trim "$time_text")" \
@@ -236,11 +211,90 @@ EOF
 			"$(trim "$jitter")" \
 			"$(trim "$latency")" \
 			"$(trim "$download")" \
-			"$(trim "$upload")" \
-			"$seq")"
-		append_record "$record"
-	done
-	: > "$MIGRATED_MARK"
+			"$(trim "$upload")")" || exit 1
+		printf '%s%s\n' "$comma" "$record" || exit 1
+		comma=','
+	done || return 1
+	printf ']\n'
 }
 
-migrate
+migrate() {
+	local pending="$MIGRATED_MARK.pending" tmp="$RESULT_JSON.tmp.$$"
+	[ -f "$LEGACY_RESULT" ] || return 0
+	[ -f "$MIGRATED_MARK" ] && return 0
+
+	# Keep the prepared IDs until completion. If history was committed but the
+	# marker could not be written, a retry reuses those IDs and skips duplicates.
+	if [ ! -f "$pending" ]; then
+		(umask 077; prepare_legacy > "$tmp") || { rm -f "$tmp"; return 1; }
+		mv "$tmp" "$pending" || { rm -f "$tmp"; return 1; }
+	fi
+	ensure_json_file || return 1
+	SPD_FILE="$RESULT_JSON" SPD_TMP="$tmp" SPD_BATCH="$pending" SPD_MARK="$MIGRATED_MARK" ucode -e '
+		let fs = require("fs");
+		let records = json(fs.readfile(getenv("SPD_FILE")));
+		let incoming = json(fs.readfile(getenv("SPD_BATCH")));
+		if (type(records) != "array" || type(incoming) != "array")
+			die("History must be a JSON array.\n");
+		let seen = {};
+		for (let record in records) {
+			if (type(record) != "object" || type(record.id) != "string")
+				die("Invalid history record.\n");
+			seen[record.id] = true;
+		}
+		let added = 0;
+		for (let record in incoming) {
+			if (type(record) != "object" || type(record.id) != "string" || !length(record.id))
+				die("Invalid migrated record.\n");
+			if (exists(seen, record.id)) continue;
+			seen[record.id] = true;
+			push(records, record);
+			added++;
+		}
+		let tmp = getenv("SPD_TMP");
+		let marker = tmp + ".mark";
+		if (added) {
+			let content = sprintf("%.2J\n", records);
+			if (fs.writefile(tmp, content) != length(content))
+				die("Unable to prepare migrated history.\n");
+		}
+		if (fs.writefile(marker, "done\n") != 5)
+			die("Unable to prepare migration marker.\n");
+		if (added && !fs.rename(tmp, getenv("SPD_FILE")))
+			die("Unable to save migrated history.\n");
+		if (!fs.rename(marker, getenv("SPD_MARK")))
+			die("Unable to save migration marker.\n");
+		fs.unlink(getenv("SPD_BATCH"));
+	' || { rm -f "$tmp" "$tmp.mark"; return 1; }
+}
+
+# Called by helper while it holds the results lock. This mode does not touch
+# the original application's data or its migration marker.
+clean_seq() {
+	local tmp="${RESULT_JSON}.tmp.$$"
+	[ -e "$RESULT_JSON" ] || return 0
+	SPD_FILE="$RESULT_JSON" SPD_TMP="$tmp" ucode -e '
+		let fs = require("fs");
+		let records = json(fs.readfile(getenv("SPD_FILE")));
+		if (type(records) != "array") die("History must be a JSON array.\n");
+		let changed = false;
+		for (let record in records) {
+			if (type(record) != "object") die("Invalid history record.\n");
+			if (exists(record, "seq")) {
+				delete record.seq;
+				changed = true;
+			}
+		}
+		if (!changed) exit(0);
+		let content = sprintf("%.2J\n", records);
+		if (fs.writefile(getenv("SPD_TMP"), content) != length(content) ||
+		    !fs.rename(getenv("SPD_TMP"), getenv("SPD_FILE")))
+			die("Unable to remove legacy test numbers.\n");
+	' || { rm -f "$tmp"; return 1; }
+}
+
+case "${1:-legacy}" in
+	legacy) migrate ;;
+	clean-seq) clean_seq ;;
+	*) echo "Syntax: $0 [legacy|clean-seq]" >&2; exit 1 ;;
+esac

@@ -345,6 +345,111 @@ function clearData() {
 	return execHelper(['clear']);
 }
 
+function renderRestoreHistory(timeFormat) {
+	var restoring = false;
+	var fileInput = E('input', {
+		'type': 'file',
+		'accept': '.json,application/json',
+		'style': 'display:none',
+		'change': async function() {
+			var file = fileInput.files[0];
+			fileInput.value = '';
+			if (!file || restoring) return;
+			restoreButton.disabled = true;
+			try {
+				var content = await file.text();
+				var records;
+				try {
+					records = JSON.parse(content);
+				} catch (err) {
+					throw new Error(_('The selected file is not valid JSON.'));
+				}
+				if (!Array.isArray(records) || records.some(function(record) {
+					return !record || typeof record !== 'object' || Array.isArray(record) ||
+						typeof record.id !== 'string' || !record.id.length;
+				})) {
+					throw new Error(_('Select a JSON file previously exported from Speedtest NG.'));
+				}
+				if (!records.length) {
+					throw new Error(_('The selected file contains no test results.'));
+				}
+
+				var cancelButton = E('button', {
+					'type': 'button', 'class': 'btn', 'click': ui.hideModal
+				}, _('Cancel'));
+				var confirmButton = E('button', {
+					'type': 'button',
+					'class': 'btn cbi-button cbi-button-apply',
+					'click': async function() {
+						if (restoring) return;
+						restoring = true;
+						confirmButton.disabled = true;
+						cancelButton.disabled = true;
+						restoreButton.disabled = true;
+						confirmButton.textContent = _('Restoring...');
+						var uploadPath = '/tmp/speedtest-ng-restore-' + Date.now().toString(36) +
+							'-' + Math.random().toString(36).slice(2) + '.json';
+						try {
+							await fs.write(uploadPath, content, 0o600);
+							var result = JSON.parse(await execHelper(['restore', uploadPath]));
+							ui.hideModal();
+							ui.addNotification(null, E('p', {},
+								_('Added %s test results. Skipped %s existing results.').format(result.added, result.skipped)), 'info');
+							try {
+								page = 1;
+								replaceHistory(result.records, timeFormat);
+								var details = document.getElementById('speedtest-detail-content');
+								if (details) {
+									details.innerHTML = '';
+									details.appendChild(detailPlaceholder());
+								}
+							} catch (err) {
+								ui.addNotification(null, E('p', {},
+									_('History was restored, but the view could not be refreshed. Reopen the Runs tab.')), 'warning');
+							}
+						} catch (err) {
+							ui.addNotification(null, E('p', {},
+								_('Unable to restore history: %s').format(err.message)), 'error');
+						} finally {
+							await fs.remove(uploadPath).catch(function() {});
+							restoring = false;
+							confirmButton.disabled = false;
+							cancelButton.disabled = false;
+							restoreButton.disabled = false;
+							confirmButton.textContent = _('Restore');
+						}
+					}
+				}, _('Restore'));
+				ui.showModal(_('Restore history'), [
+					E('p', {'style': 'overflow-wrap:anywhere'},
+						_('Add test results from "%s" to your history?').format(file.name)),
+					E('p', {}, _('Existing results and notes will be kept. Duplicate IDs will be skipped.')),
+					E('div', {'class': 'right'}, [cancelButton, ' ', confirmButton])
+				]);
+			} catch (err) {
+				ui.addNotification(null, E('p', {}, err.message), 'error');
+			} finally {
+				restoreButton.disabled = false;
+			}
+		}
+	});
+	var restoreButton = E('button', {
+		'id': 'speedtest-restore',
+		'type': 'button',
+		'class': 'btn cbi-button cbi-button-action',
+		'click': function() { fileInput.click(); }
+	}, _('Restore'));
+	return E('div', {'class': 'cbi-value'}, [
+		E('label', {'class': 'cbi-value-title', 'for': 'speedtest-restore'}, _('Restore history')),
+		E('div', {'class': 'cbi-value-field'}, [
+			E('p', {'style': 'margin:0 0 .5em'},
+				_('Upload a previously exported JSON file to add its results to your test history. Existing results will be kept, and duplicates will be skipped.')),
+			fileInput,
+			restoreButton
+		])
+	]);
+}
+
 function toRow(record, timeFormat) {
 	return {
 		id: record.id,
@@ -546,7 +651,11 @@ function csvExport(data) {
 }
 
 function jsonExport(data) {
-	return JSON.stringify(data, null, 2) + '\n';
+	return JSON.stringify(data.map(function(record) {
+		var copy = Object.assign({}, record);
+		delete copy.seq;
+		return copy;
+	}), null, 2) + '\n';
 }
 
 function exportFilename(filter, format) {
@@ -1362,6 +1471,9 @@ return view.extend({
 		o.value('latency', _('Latency'));
 		o.value('download', _('Download'));
 		o.value('upload', _('Upload'));
+
+		o = s.taboption('settings', FullWidthValue, '_restore_history');
+		o.content = renderRestoreHistory(timeFormat);
 
 		return m.render().then(function(mapNode) {
 			// Reduce the Runs table per-cell horizontal padding ~20% (theme

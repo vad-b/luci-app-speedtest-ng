@@ -44,6 +44,7 @@ Need manual package install options instead? See [Manual Installation](#manual-i
 - **Editable notes** — annotate any run; saved automatically as you type.
 - **Scheduling** — automatic tests via cron (days, time window, frequency, test type).
 - **Export** — TXT, CSV or JSON, filtered by all / manual / scheduled runs.
+- **Restore history** — Upload a previously exported JSON file in Settings to add missing tests. Existing results and notes are preserved, and duplicate IDs are skipped.
 - **Durable storage** — results are kept in a structured JSON store that survives reboots.
 - **Lightweight** — built on `speedtestcpp` and `ucode`, no heavy dependencies.
 

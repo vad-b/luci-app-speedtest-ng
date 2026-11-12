@@ -25,10 +25,6 @@ timestamp() {
 	printf '%s%s:%s' "$base" "${offset%??}" "${offset#???}"
 }
 
-ensure_json_file() {
-	[ -s "$RESULT_JSON" ] || printf '[]\n' > "$RESULT_JSON"
-}
-
 # Run "$@" while holding an exclusive lock on the results file. The lock is
 # scoped strictly to the file read-modify-write, never around the speed test
 # itself, so concurrent UI actions (delete/note) and a running test do not
@@ -40,79 +36,223 @@ with_lock() {
 	) 9>"$LOCK_FILE"
 }
 
-# Write JSON content to the results file atomically (temp + rename). Fails on
-# empty content so a failed transform never truncates the file.
-write_atomic() {
-	local content="$1"
-	local tmp="${RESULT_JSON}.tmp.$$"
+# All history operations share this implementation. Callers hold with_lock;
+# computed display numbers are added only to responses, never to stored data.
+history() {
+	local tmp="${RESULT_JSON}.tmp.$$" status
+	[ -e "$RESULT_JSON" ] || printf '[]\n' > "$RESULT_JSON" || return 1
+	SPD_ACTION="$1" SPD_FILE="$RESULT_JSON" SPD_TMP="$tmp" SPD_MIGRATOR="$LEGACY_MIGRATOR" \
+		ucode - <<'UCODE'
+import * as fs from 'fs';
 
-	[ -n "$content" ] || return 1
-	printf '%s\n' "$content" > "$tmp" && mv "$tmp" "$RESULT_JSON"
+// seq is a display position, never a stored identity. Compare instants rather
+// than timestamp strings so exports with different UTC offsets sort correctly.
+function timestamp_value(value) {
+	if (type(value) != 'string') return null;
+	let m = match(value, /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|([+-])(\d{2}):(\d{2}))$/);
+	if (!m) return null;
+	let spec = {
+		year: int(m[1], 10), mon: int(m[2], 10), mday: int(m[3], 10),
+		hour: int(m[4], 10), min: int(m[5], 10), sec: int(m[6], 10)
+	};
+	let epoch = timegm(spec);
+	if (epoch == null) return null;
+	let actual = gmtime(epoch);
+	for (let key in spec)
+		if (actual[key] != spec[key]) return null;
+	let hours = int(m[10] || '0', 10);
+	let minutes = int(m[11] || '0', 10);
+	if (hours > 23 || minutes > 59) return null;
+	let offset = (hours * 60 + minutes) * 60;
+	return epoch + (m[7] ? +m[7] : 0) - (m[9] == '-' ? -offset : offset);
 }
 
-# Append a record object (JSON string) to the results array using ucode, which
-# preserves null/number/unicode/escaping faithfully. Assigns a monotonic seq
-# (max existing + 1), writes the file atomically, and prints the stored record
-# (with seq) on stdout. Must run under with_lock.
-append_record() {
-	local tmp="${RESULT_JSON}.tmp.$$"
+function numbered(records) {
+	let ordered = map(records, function(record) {
+		return { record, time: timestamp_value(record.timestamp) };
+	});
+	sort(ordered, function(a, b) {
+		// Undated legacy records come first; ID breaks ties deterministically.
+		if (a.time == null && b.time != null) return -1;
+		if (a.time != null && b.time == null) return 1;
+		if (a.time != b.time) return a.time < b.time ? -1 : 1;
+		return a.record.id < b.record.id ? -1 : a.record.id > b.record.id ? 1 : 0;
+	});
+	return map(ordered, function(item, index) {
+		item.record.seq = index + 1;
+		return item.record;
+	});
+}
 
-	ensure_json_file
-	SPD_FILE="$RESULT_JSON" SPD_TMP="$tmp" SPD_RECORD="$1" ucode -e '
-		let fs = require("fs");
-		let arr = json(fs.readfile(getenv("SPD_FILE")));
-		if (type(arr) != "array") arr = [];
-		let rec = json(getenv("SPD_RECORD"));
-		if (type(rec) != "object") { warn("invalid record\n"); exit(1); }
-		let maxseq = 0;
-		for (let i = 0; i < length(arr); i++)
-			if (type(arr[i].seq) == "int" && arr[i].seq > maxseq)
-				maxseq = arr[i].seq;
-		rec.seq = maxseq + 1;
-		push(arr, rec);
-		fs.writefile(getenv("SPD_TMP"), sprintf("%.2J\n", arr));
-		print(sprintf("%J", rec));
-	' || { rm -f "$tmp"; return 1; }
-	[ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
-	mv "$tmp" "$RESULT_JSON"
+function read_records(path) {
+	let content = fs.readfile(path);
+	if (content == null) {
+		let error = fs.error();
+		die('Unable to read history: ' + error + '\n');
+	}
+	let records = json(content);
+	if (type(records) != 'array') die('History must be a JSON array.\n');
+	for (let record in records)
+		if (type(record) != 'object' || type(record.id) != 'string' || !length(record.id))
+			die('Each test result must have a non-empty string ID.\n');
+	return records;
+}
+
+function validate_record(record) {
+	if (record.timestamp != null) {
+		if (timestamp_value(record.timestamp) == null)
+			die('Invalid test timestamp.\n');
+	}
+	else if (!(type(record.legacy_date) == 'string' && length(record.legacy_date)) &&
+	         !(type(record.legacy_time) == 'string' && length(record.legacy_time))) {
+		die('Each test result must have a timestamp or legacy date/time.\n');
+	}
+	if (record.trigger != null && record.trigger != 'manual' && record.trigger != 'scheduled')
+		die('Invalid test run type.\n');
+	if (record.test != 'all' && record.test != 'latency' &&
+	    record.test != 'download' && record.test != 'upload')
+		die('Invalid test type.\n');
+	for (let key in ['note', 'provider', 'legacy_date', 'legacy_time'])
+		if (record[key] != null && type(record[key]) != 'string')
+			die('Invalid test field: ' + key + '.\n');
+	for (let key in ['server', 'client'])
+		if (record[key] != null && type(record[key]) != 'object')
+			die('Invalid test ' + key + ' details.\n');
+	let server = record.server || {};
+	for (let key in ['name', 'host', 'sponsor'])
+		if (server[key] != null && type(server[key]) != 'string')
+			die('Invalid server field: ' + key + '.\n');
+	if (server.id != null && type(server.id) != 'string' && type(server.id) != 'int')
+		die('Invalid server ID.\n');
+	if (server.distance_km != null && type(server.distance_km) != 'int' && type(server.distance_km) != 'double')
+		die('Invalid server distance.\n');
+	let client = record.client || {};
+	for (let key in ['ip', 'isp', 'region'])
+		if (client[key] != null && type(client[key]) != 'string')
+			die('Invalid client field: ' + key + '.\n');
+	for (let key in ['lat', 'lon'])
+		// speedtestcpp also emits coordinates as strings in existing exports.
+		if (client[key] != null && type(client[key]) != 'string' &&
+		    type(client[key]) != 'int' && type(client[key]) != 'double')
+			die('Invalid client coordinate: ' + key + '.\n');
+	let has_measurement = false;
+	for (let key in ['ping_ms', 'jitter_ms', 'latency_ms', 'download_mbit', 'upload_mbit']) {
+		if (exists(record, key)) has_measurement = true;
+		if (record[key] != null && type(record[key]) != 'int' && type(record[key]) != 'double')
+			die('Invalid test measurement: ' + key + '.\n');
+	}
+	if (!has_measurement) die('Test measurements are missing.\n');
+}
+
+function save_records(records) {
+	let content = sprintf('%.2J\n', records);
+	let tmp = getenv('SPD_TMP');
+	if (fs.writefile(tmp, content) != length(content) || !fs.rename(tmp, getenv('SPD_FILE'))) {
+		let error = fs.error();
+		fs.unlink(tmp);
+		die('Unable to save history: ' + error + '\n');
+	}
+}
+
+let action = getenv('SPD_ACTION');
+let records = read_records(getenv('SPD_FILE'));
+
+// Clean old stored numbers only when they are actually present. All callers
+// hold the history lock, including while the migration subprocess runs.
+if (length(filter(records, function(record) { return exists(record, 'seq'); }))) {
+	if (system([getenv('SPD_MIGRATOR'), 'clean-seq']) != 0)
+		die('Unable to remove legacy test numbers.\n');
+	for (let record in records) delete record.seq;
+}
+
+switch (action) {
+case 'list':
+	printf('%.2J\n', numbered(records));
+	break;
+
+case 'append': {
+	let record = json(getenv('SPD_RECORD'));
+	if (type(record) != 'object') die('Invalid test result.\n');
+	push(records, record);
+	save_records(records);
+	numbered(records);
+	printf('%J\n', record);
+	break;
+}
+
+case 'delete':
+	save_records(filter(records, function(record) { return record.id != getenv('SPD_ID'); }));
+	break;
+
+case 'note':
+	for (let record in records)
+		if (record.id == getenv('SPD_ID')) record.note = getenv('SPD_NOTE');
+	save_records(records);
+	break;
+
+case 'clear':
+	save_records([]);
+	break;
+
+case 'restore': {
+	let incoming = read_records(getenv('SPD_IMPORT'));
+	let seen = {};
+	for (let record in records) seen[record.id] = true;
+	let added = 0, skipped = 0;
+	for (let record in incoming) {
+		if (exists(seen, record.id)) {
+			skipped++;
+			continue;
+		}
+		validate_record(record);
+		delete record.seq;
+		seen[record.id] = true;
+		push(records, record);
+		added++;
+	}
+	if (added) save_records(records);
+	printf('%J\n', { added, skipped, total: length(records), records: numbered(records) });
+	break;
+}
+
+default:
+	die('Unknown history action.\n');
+}
+UCODE
+	status=$?
+	[ "$status" -eq 0 ] || rm -f "$tmp"
+	return "$status"
+}
+
+list_records() {
+	migrate_legacy || return 1
+	history list
+}
+
+# Store the result and return it with its computed chronological position.
+append_record() {
+	migrate_legacy || return 1
+	SPD_RECORD="$1" history append
 }
 
 # Remove the record with the given id. Must run under with_lock.
 delete_record() {
-	local out
-
-	ensure_json_file
-	out="$(SPD_FILE="$RESULT_JSON" SPD_ID="$1" ucode -e '
-		let fs = require("fs");
-		let arr = json(fs.readfile(getenv("SPD_FILE")));
-		if (type(arr) != "array") arr = [];
-		let id = getenv("SPD_ID");
-		print(sprintf("%.2J", filter(arr, function(r) { return r.id != id; })));
-	')" || return 1
-	write_atomic "$out"
+	SPD_ID="$1" history delete
 }
 
 # Set the note field of the record with the given id. Must run under with_lock.
 note_record() {
-	local out
-
-	ensure_json_file
-	out="$(SPD_FILE="$RESULT_JSON" SPD_ID="$1" SPD_NOTE="$2" ucode -e '
-		let fs = require("fs");
-		let arr = json(fs.readfile(getenv("SPD_FILE")));
-		if (type(arr) != "array") arr = [];
-		let id = getenv("SPD_ID");
-		let note = getenv("SPD_NOTE");
-		for (let i = 0; i < length(arr); i++)
-			if (arr[i].id == id) arr[i].note = note;
-		print(sprintf("%.2J", arr));
-	')" || return 1
-	write_atomic "$out"
+	SPD_ID="$1" SPD_NOTE="$2" history note
 }
 
 # Replace all results with an empty array. Must run under with_lock.
 clear_records() {
-	write_atomic '[]'
+	history clear
+}
+
+restore_records() {
+	migrate_legacy || return 1
+	SPD_IMPORT="$1" history restore
 }
 
 migrate_legacy() {
@@ -130,7 +270,7 @@ migrate_legacy() {
 # Build a result record object from the speed test JSON output. Pure transform
 # (no file access, no lock): parses the response once with ucode and maps it to
 # the stored schema, preserving null/number types natively. The seq field is
-# assigned later by append_record under the lock.
+# derived from chronology when returning results to the UI.
 build_record() {
 	SPD_RESPONSE="$1" SPD_ID="$2" SPD_TS="$3" SPD_TRIGGER="$4" SPD_TEST="$5" SPD_NOTE="$6" ucode -e '
 		let resp = json(getenv("SPD_RESPONSE")) || {};
@@ -178,8 +318,6 @@ run_test() {
 		return 1
 	}
 
-	migrate_legacy
-
 	id="$(uuid)"
 	ts="$(timestamp)"
 
@@ -198,12 +336,15 @@ run_test() {
 
 case "$1" in
 	migrate)
-		migrate_legacy
+		with_lock migrate_legacy
 		;;
 	list)
-		migrate_legacy
-		ensure_json_file
-		cat "$RESULT_JSON"
+		with_lock list_records
+		;;
+	restore)
+		shift
+		[ $# -eq 1 ] || { echo "Syntax: $0 restore <JSON file>" >&2; exit 1; }
+		with_lock restore_records "$1"
 		;;
 	run)
 		shift
@@ -224,7 +365,7 @@ case "$1" in
 		with_lock clear_records
 		;;
 	*)
-		echo "Syntax: $0 <migrate|list|run|delete|note|clear>" >&2
+		echo "Syntax: $0 <migrate|list|restore|run|delete|note|clear>" >&2
 		exit 1
 		;;
 esac

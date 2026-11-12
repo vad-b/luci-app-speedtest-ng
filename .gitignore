@@ -6,8 +6,12 @@
 /.dev/**/target.env
 /.dev/**/.ssh/
 
+# Local files
+/.private
+
 # Router runtime data
 /root/etc/speedtest_result
 /root/etc/speedtest_result.legacy
 /root/etc/speedtest-ng_results.json
 /root/etc/speedtest-ng_migrated
+/root/etc/speedtest-ng_migrated.pending

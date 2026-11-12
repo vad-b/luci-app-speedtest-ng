@@ -9,7 +9,10 @@
 			}
 		},
 		"write": {
-			"uci": [ "speedtest-ng" ]
+			"uci": [ "speedtest-ng" ],
+			"file": {
+				"/tmp/speedtest-ng-restore-*.json": [ "write" ]
+			}
 		}
 	}
 }
