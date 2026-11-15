@@ -12,6 +12,8 @@ Auto-detects `opkg` / `apk` and installs the matching latest release package (`.
 wget -qO- https://raw.githubusercontent.com/vad-b/luci-app-speedtest-ng/main/install.sh | sh
 ```
 
+Requires OpenWrt with LuCI. The package manager automatically installs the declared dependencies: `speedtestcpp`, `ucode`, `ucode-mod-fs` and `flock`.
+
 After installation, navigate to **Network -> Speedtest NG** in the LuCI web interface.
 
 Need manual package install options instead? See [Manual Installation](#manual-installation).

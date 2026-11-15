@@ -7,7 +7,9 @@ Run the commands below from the repository root in Bash (Git Bash on Windows).
 ## Requirements
 
 - Bash, Git and the OpenSSH tools required by [Router SSH](../router-ssh/README.md).
-- An OpenWrt router with LuCI, `speedtestcpp` and `ucode` installed.
+- An OpenWrt router with LuCI.
+
+Dependencies: `speedtestcpp`, `ucode`, `ucode-mod-fs` and `flock`. Missing packages are installed automatically.
 
 ## Setup
 

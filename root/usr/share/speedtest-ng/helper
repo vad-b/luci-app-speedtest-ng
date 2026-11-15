@@ -9,6 +9,8 @@ LEGACY_RESULT="/etc/speedtest_result"
 MIGRATED_MARK="/etc/speedtest-ng_migrated"
 LEGACY_MIGRATOR="/usr/share/speedtest-ng/migrate-legacy"
 LOCK_FILE="/tmp/luci-app-speedtest-ng-results.lock"
+RUN_DIR="/var/run/speedtest-ng"
+TEST_TIMEOUT=180
 
 uuid() {
 	if [ -r /proc/sys/kernel/random/uuid ]; then
@@ -31,7 +33,12 @@ timestamp() {
 # clobber each other.
 with_lock() {
 	(
-		flock -x 9 || { echo "Failed to acquire results lock" >&2; exit 1; }
+		local retries=10
+		until flock -xn 9; do
+			[ "$retries" -gt 0 ] || { echo "Failed to acquire results lock within 10 seconds" >&2; exit 1; }
+			sleep 1
+			retries=$((retries - 1))
+		done
 		"$@"
 	) 9>"$LOCK_FILE"
 }
@@ -64,7 +71,7 @@ function timestamp_value(value) {
 	let minutes = int(m[11] || '0', 10);
 	if (hours > 23 || minutes > 59) return null;
 	let offset = (hours * 60 + minutes) * 60;
-	return epoch + (m[7] ? +m[7] : 0) - (m[9] == '-' ? -offset : offset);
+	return epoch + (m[7] ? +('0' + m[7]) : 0) - (m[9] == '-' ? -offset : offset);
 }
 
 function numbered(records) {
@@ -267,15 +274,57 @@ migrate_legacy() {
 	"$LEGACY_MIGRATOR"
 }
 
+# CGI streams stdout even for unsuccessful commands. Keep failures structured
+# so the UI can report them; the exit status still signals failure to cron/SSH.
+run_error() {
+	if command -v ucode >/dev/null 2>&1; then
+		SPD_ERROR="$1" ucode -e 'printf("%J\n", { error: getenv("SPD_ERROR") });'
+	else
+		printf '{"error":"Required command ucode is missing. Reinstall the application and its dependencies."}\n'
+	fi
+	return 1
+}
+
+check_run_dependencies() {
+	local name
+	for name in ucode speedtest flock; do
+		if ! command -v "$name" >/dev/null 2>&1; then
+			run_error "Required command $name is missing. Reinstall the application and its dependencies."
+			return 1
+		fi
+	done
+	if ! ucode -e 'require("fs");' >/dev/null 2>&1; then
+		run_error "The ucode fs module is unavailable. Install the ucode-mod-fs package matching your firmware."
+		return 1
+	fi
+}
+
 # Build a result record object from the speed test JSON output. Pure transform
 # (no file access, no lock): parses the response once with ucode and maps it to
 # the stored schema, preserving null/number types natively. The seq field is
 # derived from chronology when returning results to the UI.
 build_record() {
 	SPD_RESPONSE="$1" SPD_ID="$2" SPD_TS="$3" SPD_TRIGGER="$4" SPD_TEST="$5" SPD_NOTE="$6" ucode -e '
-		let resp = json(getenv("SPD_RESPONSE")) || {};
+		let fail = function(message) { warn(message, "\n"); exit(1); };
+		let response = getenv("SPD_RESPONSE");
+		if (!length(trim(response))) fail("speedtestcpp returned an empty response.");
+		let resp;
+		try { resp = json(response); }
+		catch (e) { fail("speedtestcpp returned invalid JSON. Check that the speedtest command is provided by speedtestcpp."); }
+		if (type(resp) != "object") fail("speedtestcpp returned an unexpected JSON format.");
+		if (resp.error != null)
+			fail(type(resp.error) == "string" ? resp.error : "speedtestcpp reported an error.");
+		if ((resp.server != null && type(resp.server) != "object") ||
+		    (resp.client != null && type(resp.client) != "object"))
+			fail("speedtestcpp returned invalid client or server details.");
 		let s = resp.server || {};
 		let c = resp.client || {};
+		let numeric = function(value) { return type(value) == "int" || type(value) == "double"; };
+		let test = getenv("SPD_TEST");
+		if ((test == "latency" && !numeric(resp.ping) && !numeric(s.latency)) ||
+		    ((test == "all" || test == "download") && !numeric(resp.download_mbit)) ||
+		    ((test == "all" || test == "upload") && !numeric(resp.upload_mbit)))
+			fail("speedtestcpp returned no measurements for the requested test.");
 		printf("%J", {
 			id: getenv("SPD_ID"),
 			timestamp: getenv("SPD_TS"),
@@ -308,30 +357,112 @@ run_test() {
 	local trigger="$1"
 	local test="$2"
 	local note="${3:-}"
-	local response record stored id ts
+	local response record stored id ts error_file engine_status build_status engine_error build_error
+
+	check_run_dependencies || return 1
+	error_file="$(mktemp /tmp/speedtest-ng-error.XXXXXX)" || {
+		run_error "Unable to create a temporary file for speedtest diagnostics."
+		return 1
+	}
 
 	set -- speedtest --output json
 	[ "$test" != "all" ] && set -- "$@" "--$test"
 
-	response="$("$@")" || {
-		printf '{"error":"speedtest failed"}\n'
-		return 1
-	}
+	# Execute speedtest directly so the timeout kills the engine itself, not a
+	# shell wrapper. ucode's system() sends SIGKILL and reaps the child process.
+	response="$(SPD_TIMEOUT="$TEST_TIMEOUT" ucode -e '
+		let timeout = +getenv("SPD_TIMEOUT");
+		let start = clock(true);
+		let status = system(ARGV, timeout * 1000);
+		let end = clock(true);
+		let elapsed = end[0] - start[0] + (end[1] - start[1]) / 1000000000;
+		if (status == -9 && elapsed >= timeout) {
+			warn("Speed test timed out after ", timeout, " seconds.\n");
+			exit(124);
+		}
+		if (status < 0) {
+			warn("speedtestcpp was terminated by signal ", -status, ".\n");
+			exit(128 - status);
+		}
+		exit(status);
+	' -- "$@" 2>"$error_file")"
+	engine_status=$?
+	engine_error="$(head -c 2048 "$error_file")"
 
 	id="$(uuid)"
 	ts="$(timestamp)"
 
-	record="$(build_record "$response" "$id" "$ts" "$trigger" "$test" "$note")" || {
-		printf '{"error":"failed to build result"}\n'
+	record="$(build_record "$response" "$id" "$ts" "$trigger" "$test" "$note" 2>"$error_file")"
+	build_status=$?
+	build_error="$(head -c 2048 "$error_file")"
+	if [ "$engine_status" -ne 0 ]; then
+		rm -f "$error_file"
+		# speedtestcpp normally reports network failures as JSON on stdout.
+		# Keep that reason, or stderr when execution failed before JSON output.
+		if [ -n "$engine_error" ]; then
+			run_error "speedtestcpp failed (exit code $engine_status): $engine_error"
+		elif [ -n "$response" ] && [ -n "$build_error" ]; then
+			run_error "speedtestcpp failed (exit code $engine_status): $build_error"
+		else
+			run_error "speedtestcpp failed (exit code $engine_status)."
+		fi
 		return 1
-	}
+	fi
+	if [ "$build_status" -ne 0 ]; then
+		rm -f "$error_file"
+		run_error "${build_error:-Unable to build the speed test result.}"
+		return 1
+	fi
 
-	stored="$(with_lock append_record "$record")" || {
-		printf '{"error":"failed to store result"}\n'
+	stored="$(with_lock append_record "$record" 2>"$error_file")" || {
+		build_error="$(head -c 2048 "$error_file")"
+		rm -f "$error_file"
+		run_error "Unable to save the speed test result. $build_error"
 		return 1
 	}
+	rm -f "$error_file"
 
 	printf '{"record":%s}\n' "$stored"
+}
+
+# A CGI request must finish quickly: uhttpd can terminate it before a slow test
+# finishes. Run independently and let the UI collect the result with short RPCs.
+start_test() {
+	local job
+	check_run_dependencies || return 1
+	(umask 077; mkdir -p "$RUN_DIR") || { run_error "Unable to create the speed test directory."; return 1; }
+	# Retain completed jobs for an hour so a failed poll can safely be retried.
+	find "$RUN_DIR" -type f -mmin +60 -exec rm -f {} \;
+	job="$(mktemp "$RUN_DIR/XXXXXX")" || { run_error "Unable to create a speed test job."; return 1; }
+	(
+		umask 077
+		run_test "$@" > "$job.tmp"
+		mv "$job.tmp" "$job.result"
+	) </dev/null >/dev/null 2>&1 &
+	printf '%s\n' "$!" > "$job"
+	printf '{"job":"%s"}\n' "${job##*/}"
+}
+
+test_status() {
+	local job pid running=0
+	case "$1" in
+		''|*[!a-zA-Z0-9]*) run_error "Invalid speed test job."; return 1 ;;
+	esac
+	[ "${#1}" -eq 6 ] || { run_error "Invalid speed test job."; return 1; }
+	job="$RUN_DIR/$1"
+	pid="$(cat "$job" 2>/dev/null)"
+	case "$pid" in
+		''|*[!0-9]*) run_error "The speed test job was not found. Please run the test again."; return 1 ;;
+	esac
+	kill -0 "$pid" 2>/dev/null && running=1
+	# Check the result after the process: it may finish between these checks.
+	if [ -s "$job.result" ]; then
+		cat "$job.result"
+	elif [ "$running" -eq 1 ]; then
+		printf '{"running":true}\n'
+	else
+		run_error "The speed test was interrupted before returning a result. Check the router logs."
+	fi
 }
 
 case "$1" in
@@ -346,10 +477,16 @@ case "$1" in
 		[ $# -eq 1 ] || { echo "Syntax: $0 restore <JSON file>" >&2; exit 1; }
 		with_lock restore_records "$1"
 		;;
-	run)
+	run|start)
+		action="$1"
 		shift
 		[ $# -ge 2 ] || { echo "Syntax: $0 run <manual|scheduled> <all|latency|download|upload> [note]" >&2; exit 1; }
-		run_test "$1" "$2" "${3:-}"
+		case "$1" in manual|scheduled) ;; *) run_error "Invalid test trigger."; exit 1 ;; esac
+		case "$2" in all|latency|download|upload) ;; *) run_error "Invalid test type."; exit 1 ;; esac
+		if [ "$action" = start ]; then start_test "$1" "$2" "${3:-}"; else run_test "$1" "$2" "${3:-}"; fi
+		;;
+	status)
+		test_status "$2"
 		;;
 	delete)
 		shift
@@ -365,7 +502,7 @@ case "$1" in
 		with_lock clear_records
 		;;
 	*)
-		echo "Syntax: $0 <migrate|list|restore|run|delete|note|clear>" >&2
+		echo "Syntax: $0 <migrate|list|restore|run|start|status|delete|note|clear>" >&2
 		exit 1
 		;;
 esac

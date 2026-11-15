@@ -16,7 +16,7 @@ MAP_MODE=()
 MAP_POLICY=()
 
 APP_VERSION="$(sed -n 's/^PKG_VERSION:=//p' "$APP_ROOT/Makefile" | tr -d '\r')"
-ROUTER_TOOLS=(uci ucode speedtest scp ls awk)
+ROUTER_TOOLS=(uci ucode speedtest flock scp ls awk)
 POST_SYNC_COMMANDS=(
   "sed -i 's/@APP_VERSION@/$APP_VERSION/g' /www/luci-static/resources/view/speedtest-ng/speedtest.js"
   "rm -f /tmp/luci-indexcache*"
@@ -107,6 +107,7 @@ check_router() {
   local command="[ -f /etc/openwrt_release ] || { echo 'ERROR: target is not an OpenWrt router' >&2; exit 1; };"
   if [[ "$RUN_MODE" == deploy ]]; then
     command+=" for tool in ${ROUTER_TOOLS[*]}; do command -v \"\$tool\" >/dev/null 2>&1 || { echo \"ERROR: missing router command: \$tool\" >&2; exit 1; }; done;"
+    command+=" ucode -e 'require(\"fs\");' >/dev/null 2>&1 || { echo 'ERROR: missing or incompatible ucode-mod-fs' >&2; exit 1; };"
     command+=" [ -d /www/luci-static/resources ] && [ -x /etc/init.d/rpcd ] || { echo 'ERROR: LuCI or rpcd is missing' >&2; exit 1; }"
   fi
   remote "$command"

@@ -7,11 +7,11 @@ include $(TOPDIR)/rules.mk
 
 LUCI_TITLE:=LuCI for Speedtest (NG)
 LUCI_DESCRIPTION:=Run and track network speed tests from LuCI using speedtestcpp
-LUCI_DEPENDS:=+speedtestcpp +ucode
+LUCI_DEPENDS:=+speedtestcpp +ucode +ucode-mod-fs +flock
 LUCI_PKGARCH:=all
 LUCI_MAINTAINER:=vad-b
 
-PKG_VERSION:=1.0.1
+PKG_VERSION:=1.0.2
 PKG_RELEASE:=1
 PKG_PO_VERSION:=$(PKG_VERSION)-r$(PKG_RELEASE)
 PKG_LICENSE:=GPL-3.0-only

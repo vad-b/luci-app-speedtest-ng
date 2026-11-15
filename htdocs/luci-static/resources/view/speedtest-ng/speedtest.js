@@ -1220,17 +1220,45 @@ function setStatus(state, message) {
 	status.textContent = message;
 }
 
-function withTimeout(promise, timeoutMs) {
-	var timer;
-	var timeout = new Promise(function(resolve, reject) {
-		timer = window.setTimeout(function() {
-			reject(new Error(_('Speedtest timed out. Please check your connection and try again.')));
-		}, timeoutMs);
-	});
+async function runCommand(args) {
+	var response = await fs.exec('/usr/share/speedtest-ng/helper', args);
+	if (!response || typeof response.stdout !== 'string' || !response.stdout.trim()) {
+		throw new Error(response && response.stderr || _('The router returned no speed test response. Check the router logs.'));
+	}
+	var result;
+	try {
+		result = JSON.parse(response.stdout);
+	} catch (err) {
+		throw new Error(_('The router returned an invalid speed test response. Check the router logs.'));
+	}
+	if (result && result.error) {
+		throw new Error(typeof result.error === 'string' ? result.error : _('The speed test failed.'));
+	}
+	if (response.code !== 0 || !result || typeof result !== 'object') {
+		throw new Error(response.stderr || _('The speed test failed.'));
+	}
+	return result;
+}
 
-	return Promise.race([promise, timeout]).finally(function() {
-		window.clearTimeout(timer);
-	});
+async function runTest(test) {
+	var started = await runCommand(['start', 'manual', test]);
+	if (typeof started.job !== 'string' || !/^[a-zA-Z0-9]{6}$/.test(started.job)) {
+		throw new Error(_('The router did not start the speed test.'));
+	}
+	// Allow the backend's 180-second engine limit, bounded history lock wait,
+	// and delivery of the final result or timeout error.
+	var deadline = Date.now() + 210000;
+	while (Date.now() < deadline) {
+		var result = await runCommand(['status', started.job]);
+		if (result.record && typeof result.record.id === 'string' && result.record.id) {
+			return result.record;
+		}
+		if (result.running !== true) {
+			throw new Error(_('The router returned no valid test result. Check the router logs.'));
+		}
+		await new Promise(function(resolve) { window.setTimeout(resolve, 1000); });
+	}
+	throw new Error(_('The router did not return a test result in time. Check the router logs.'));
 }
 
 function bindUciOption(option, sectionName, optionName) {
@@ -1301,10 +1329,7 @@ var RunControlsValue = form.DummyValue.extend({
 				setBusy(true);
 				setStatus('running', _('Running...'));
 
-				withTimeout(fs.exec_direct('/usr/share/speedtest-ng/helper', ['run', 'manual', selectedTest]), 180000).then(function(response) {
-					var result = JSON.parse(response);
-					var record = result.record || {};
-
+				runTest(selectedTest).then(function(record) {
 					renderDetail(record, timeFormat);
 					highlightRunDetails();
 					setStatus(null, '');
@@ -1318,13 +1343,7 @@ var RunControlsValue = form.DummyValue.extend({
 						});
 					}
 				}).catch(function(err) {
-					if (!err.response) {
-						setStatus('error', err.message || _('No response received from speedtest. Please check your internet connection or try again later.'));
-					} else if (err.response.data && err.response.data.error === 'unable to retrieve your ip info') {
-						setStatus('error', _('Unable to retrieve IP information. Please check your internet connection.'));
-					} else {
-						setStatus('error', err);
-					}
+					setStatus('error', err.message || String(err));
 				}).finally(function() {
 					setBusy(false);
 				});
